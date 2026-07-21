@@ -1,0 +1,33 @@
+{
+  "name": "tradingbot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Multi-strategy Alpaca trading bot with a read-only monitoring dashboard. Runs on Vercel; the bot tick is driven by an external scheduler.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:push": "drizzle-kit push"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.0.1",
+    "drizzle-orm": "^0.44.2",
+    "next": "^15.4.2",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "recharts": "^3.1.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.11",
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "drizzle-kit": "^0.31.4",
+    "tailwindcss": "^4.1.11",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}
