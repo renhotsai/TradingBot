@@ -23,6 +23,12 @@ export interface OrderStatus {
   filledQty: number | null;
 }
 
+export interface BrokerPosition {
+  symbol: string;
+  side: Direction;
+  qty: number;
+}
+
 export interface Broker {
   getAccount(): Promise<AccountInfo>;
   isMarketOpen(): Promise<boolean>;
@@ -39,6 +45,11 @@ export interface Broker {
    * only way to find it again if the response to the initial submit was
    * lost before a broker order id could be captured. Null if unknown. */
   getOrderByClientOrderId(clientOrderId: string): Promise<OrderStatus | null>;
+  /** The account's real positions, straight from the broker — the source of
+   * truth the engine checks itself against before opening a new position and
+   * right after every fill, rather than trusting its own records alone. */
+  getOpenPositions(): Promise<BrokerPosition[]>;
+  getOpenPosition(symbol: string): Promise<BrokerPosition | null>;
 }
 
 const DATA_URL = "https://data.alpaca.markets";
@@ -235,6 +246,28 @@ export class AlpacaBroker implements Broker {
         filledAvgPrice: raw.filled_avg_price ? parseFloat(raw.filled_avg_price) : null,
         filledQty: raw.filled_qty ? parseFloat(raw.filled_qty) : null,
       };
+    } catch {
+      return null;
+    }
+  }
+
+  async getOpenPositions(): Promise<BrokerPosition[]> {
+    const raw = await this.request<{ symbol: string; side: string; qty: string }[]>(
+      `${this.baseUrl}/v2/positions`,
+    );
+    return raw.map((p) => ({
+      symbol: p.symbol,
+      side: p.side === "short" ? "short" : "long",
+      qty: Math.abs(parseFloat(p.qty)),
+    }));
+  }
+
+  async getOpenPosition(symbol: string): Promise<BrokerPosition | null> {
+    try {
+      const p = await this.request<{ symbol: string; side: string; qty: string }>(
+        `${this.baseUrl}/v2/positions/${encodeURIComponent(symbol)}`,
+      );
+      return { symbol: p.symbol, side: p.side === "short" ? "short" : "long", qty: Math.abs(parseFloat(p.qty)) };
     } catch {
       return null;
     }

@@ -1,5 +1,5 @@
 import type { InstrumentConfig } from "@/config";
-import type { AccountInfo, Broker, OrderResult, OrderStatus } from "@/bot/broker";
+import type { AccountInfo, Broker, BrokerPosition, OrderResult, OrderStatus } from "@/bot/broker";
 import type { Candle } from "@/bot/strategies/types";
 import type { BotState, PendingOrder, Position, Store, TradeRecord } from "@/bot/store";
 
@@ -39,7 +39,12 @@ export class FakeBroker implements Broker {
   /** Symbols whose submitMarketOrder call should throw, to exercise cleanup
    * of the pending-order record on a rejected/failed submission. */
   failSymbols = new Set<string>();
+  /** The broker's own view of open positions, kept up to date as fills are
+   * confirmed (immediately or via resolveOrder) — what getOpenPosition(s)
+   * reads from, so tests can seed or desync it to exercise reconciliation. */
+  brokerPositions = new Map<string, BrokerPosition>();
   private orderRecords = new Map<string, OrderStatus>();
+  private orderMeta = new Map<string, { symbol: string; side: "buy" | "sell" }>();
   private clientOrderIds = new Map<string, string>();
 
   async getAccount(): Promise<AccountInfo> {
@@ -81,7 +86,9 @@ export class FakeBroker implements Broker {
       filledQty: price !== null ? qty : null,
     };
     this.orderRecords.set(orderId, status);
+    this.orderMeta.set(orderId, { symbol: instrument.symbol, side });
     this.clientOrderIds.set(clientOrderId, orderId);
+    if (price !== null) this.applyFill(instrument.symbol, side, qty);
     return { orderId, filledAvgPrice: status.filledAvgPrice, filledQty: status.filledQty };
   }
 
@@ -96,9 +103,36 @@ export class FakeBroker implements Broker {
     return orderId ? this.getOrderStatus(orderId) : null;
   }
 
+  async getOpenPositions(): Promise<BrokerPosition[]> {
+    return [...this.brokerPositions.values()];
+  }
+
+  async getOpenPosition(symbol: string): Promise<BrokerPosition | null> {
+    return this.brokerPositions.get(symbol) ?? null;
+  }
+
   /** Test helper: simulate the broker confirming a fill on a later poll/tick. */
   async resolveOrder(orderId: string, filledAvgPrice: number, filledQty: number): Promise<void> {
     this.orderRecords.set(orderId, { orderId, status: "filled", filledAvgPrice, filledQty });
+    const meta = this.orderMeta.get(orderId);
+    if (meta) this.applyFill(meta.symbol, meta.side, filledQty);
+  }
+
+  private applyFill(symbol: string, side: "buy" | "sell", qty: number): void {
+    const existing = this.brokerPositions.get(symbol);
+    if (!existing) {
+      this.brokerPositions.set(symbol, { symbol, side: side === "buy" ? "long" : "short", qty });
+      return;
+    }
+    const isClosing =
+      (existing.side === "long" && side === "sell") || (existing.side === "short" && side === "buy");
+    if (isClosing) {
+      const remaining = existing.qty - qty;
+      if (remaining <= 1e-9) this.brokerPositions.delete(symbol);
+      else this.brokerPositions.set(symbol, { ...existing, qty: remaining });
+    } else {
+      this.brokerPositions.set(symbol, { ...existing, qty: existing.qty + qty });
+    }
   }
 }
 

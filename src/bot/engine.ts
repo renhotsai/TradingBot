@@ -281,6 +281,27 @@ export class TradingEngine {
       );
     }
     await this.store.deletePendingOrder(po.id);
+
+    // Confirm the broker's own state agrees with what was just written,
+    // rather than trusting the fill response alone.
+    try {
+      const brokerPosition = await this.broker.getOpenPosition(po.symbol);
+      if (po.purpose === "open") {
+        if (!brokerPosition || brokerPosition.side !== po.direction || qtyMismatch(brokerPosition.qty, filledQty)) {
+          report.errors.push(
+            `${po.symbol}: RECONCILE mismatch after open — bot recorded ${po.direction} ${filledQty}, Alpaca shows ` +
+              (brokerPosition ? `${brokerPosition.side} ${brokerPosition.qty}` : "no position"),
+          );
+        }
+      } else if (brokerPosition) {
+        report.errors.push(
+          `${po.symbol}: RECONCILE mismatch after close — bot recorded the position closed, but Alpaca still shows ` +
+            `${brokerPosition.side} ${brokerPosition.qty}`,
+        );
+      }
+    } catch (e) {
+      report.errors.push(`${po.symbol}: post-fill reconcile check failed: ${message(e)}`);
+    }
   }
 
   private async applyDecision(
@@ -350,6 +371,18 @@ export class TradingEngine {
       return;
     }
 
+    // Confirm with the broker that this symbol is actually flat before
+    // adding exposure — the DB has no record of a position, but that's only
+    // trustworthy if it agrees with Alpaca's own account state.
+    const existingBrokerPosition = await this.broker.getOpenPosition(instrument.symbol);
+    if (existingBrokerPosition) {
+      report.errors.push(
+        `${instrument.symbol}: RECONCILE mismatch — bot has no record of a position but Alpaca shows ` +
+          `${existingBrokerPosition.side} ${existingBrokerPosition.qty}; skipping entry`,
+      );
+      return;
+    }
+
     const side = direction === "long" ? "buy" : "sell";
     const pending = await this.store.createPendingOrder({
       clientOrderId: randomUUID(),
@@ -391,6 +424,34 @@ export class TradingEngine {
     now: Date,
     report: TickReport,
   ): Promise<void> {
+    // Confirm with the broker what's actually held before submitting a
+    // close — this is what a stale/rounded DB quantity would otherwise
+    // trip over (a close sized to the DB's qty can be rejected for
+    // insufficient balance if the real fill was fractionally smaller).
+    const brokerPosition = await this.broker.getOpenPosition(instrument.symbol);
+    if (!brokerPosition) {
+      report.errors.push(
+        `${instrument.symbol}: RECONCILE mismatch — bot has an open ${position.direction} ${position.qty} ` +
+          `but Alpaca shows no position; dropping the stale record`,
+      );
+      await this.store.deletePosition(instrument.symbol);
+      return;
+    }
+    if (brokerPosition.side !== position.direction) {
+      report.errors.push(
+        `${instrument.symbol}: RECONCILE mismatch — bot has ${position.direction} but Alpaca shows ` +
+          `${brokerPosition.side}; skipping close for manual review`,
+      );
+      return;
+    }
+    const closeQty = brokerPosition.qty;
+    if (qtyMismatch(brokerPosition.qty, position.qty)) {
+      report.actions.push(
+        `${instrument.symbol}: qty mismatch — bot recorded ${position.qty}, Alpaca shows ${brokerPosition.qty}; ` +
+          `closing the broker's actual quantity`,
+      );
+    }
+
     const side = directionToCloseSide(position.direction);
     const pending = await this.store.createPendingOrder({
       clientOrderId: randomUUID(),
@@ -398,7 +459,7 @@ export class TradingEngine {
       symbol: instrument.symbol,
       side,
       purpose: "close",
-      qty: position.qty,
+      qty: closeQty,
       strategy: position.strategy,
       direction: position.direction,
       atrAtEntry: null,
@@ -411,14 +472,14 @@ export class TradingEngine {
 
     let order: OrderResult;
     try {
-      order = await this.broker.submitMarketOrder(instrument, side, position.qty, pending.clientOrderId);
+      order = await this.broker.submitMarketOrder(instrument, side, closeQty, pending.clientOrderId);
     } catch (e) {
       await this.store.deletePendingOrder(pending.id);
       throw e;
     }
 
     if (order.filledAvgPrice !== null) {
-      await this.finalizePendingOrder(pending, order.filledAvgPrice, order.filledQty ?? position.qty, now, report);
+      await this.finalizePendingOrder(pending, order.filledAvgPrice, order.filledQty ?? closeQty, now, report);
     } else {
       await this.store.attachBrokerOrderId(pending.id, order.orderId);
       report.actions.push(`${instrument.symbol}: ${side} order submitted to close position, awaiting fill confirmation`);
@@ -428,4 +489,9 @@ export class TradingEngine {
 
 function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/** True when two quantities differ by more than a small rounding tolerance. */
+function qtyMismatch(a: number, b: number): boolean {
+  return Math.abs(a - b) > Math.max(1e-6, Math.abs(a) * 0.001);
 }
