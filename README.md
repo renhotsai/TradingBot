@@ -20,6 +20,9 @@ cycle lives in one API route:
 cron-job.org ──every minute──▶ GET /api/cron/tick  (Authorization: Bearer CRON_SECRET)
                                    │
                                    ├─ read state from Neon Postgres
+                                   ├─ finish any order a previous tick submitted but didn't
+                                   │    see through to a filled/rejected outcome
+                                   ├─ adopt any Alpaca position the DB has no record of
                                    ├─ check hard stops / trailing stops on open positions
                                    ├─ for each instrument with a newly closed bar:
                                    │    fetch candles from Alpaca → compute signal →
@@ -60,6 +63,40 @@ overlapping ticks from double-ordering.
 - **Resilience** — Alpaca calls retry with exponential backoff (2s/4s/8s); a
   failing instrument or a failed tick never crashes the endpoint — errors are
   recorded and the next minute's tick retries.
+
+## Order execution & reconciliation
+
+The bot's database and Alpaca's account are two independently-updated
+systems, so the engine never just assumes they agree:
+
+- **Pending-order log** — before submitting any order, the engine writes a
+  `pending_orders` row with everything needed to finalize it (symbol, side,
+  qty, strategy, and Alpaca's `client_order_id`). The `positions` /
+  `trades` tables are only written once the fill is *confirmed* by the
+  broker — immediately if it fills within the short poll window,
+  otherwise on a later tick once reconciliation confirms it. This closes
+  the gap where a tick could die between "order submitted" and "position
+  recorded," which used to leave a real Alpaca position untracked or a DB
+  position Alpaca no longer had.
+- **Broker checks around every order** — before opening, the engine
+  confirms the symbol is actually flat at Alpaca; before closing, it closes
+  whatever Alpaca actually holds (not the DB's recorded quantity — crypto
+  fills can differ fractionally from the requested size); after a fill,
+  it re-reads the position back from Alpaca and flags a `RECONCILE
+  mismatch` if it doesn't match what was just written.
+- **Untracked-position sweep** — every tick, the engine lists everything
+  Alpaca actually holds and adopts anything the DB has no record of
+  (a manual trade, or a position predating this logic): it computes a real
+  ATR-based hard/trailing stop from fresh candles and the broker's own
+  average entry price, so it comes under the same protection as a
+  bot-opened position starting that same tick rather than sitting exposed
+  indefinitely. Logged as a `RECONCILE mismatch` either way, visible in
+  `lastError` / the dashboard.
+
+Symbol note: Alpaca's positions endpoints identify crypto without the
+slash (`BTCUSD`) while orders/bars use it (`BTC/USD`, matching
+`src/config.ts`) — the broker layer normalizes this internally so the rest
+of the engine only ever deals in the canonical (slash) form.
 
 ## Setup
 
@@ -140,11 +177,13 @@ Project layout:
 src/config.ts                 instruments, timeframes, strategy + risk parameters
 src/bot/strategies/           meanReversion.ts, momentumBreakout.ts, trendFollowing.ts
 src/bot/riskManager.ts        ATR, sizing, hard/trailing stops, correlation filter
-src/bot/broker.ts             Alpaca REST client (bars, orders, account, clock) + retries
-src/bot/engine.ts             one full tick cycle (pure orchestration, unit-tested)
+src/bot/broker.ts             Alpaca REST client (bars, orders, positions, account, clock) + retries
+src/bot/engine.ts             one full tick cycle: pending-order reconciliation, untracked-
+                               position adoption, stops, signals (pure orchestration, unit-tested)
 src/bot/store.ts              storage interface used by the engine
-src/db/                       Drizzle schema + Neon store implementation
+src/db/                       Drizzle schema (positions, trades, pending_orders, …) + Neon store
 src/app/api/cron/tick/        the scheduled bot endpoint (auth + lock + engine)
+src/app/api/admin/migrate/    one-time/idempotent hosted schema setup (CREATE TABLE IF NOT EXISTS)
 src/app/api/…                 dashboard JSON endpoints + CSV exports
 src/components/               dashboard UI (Recharts)
 tests/                        vitest suites with synthetic candles + fake broker
@@ -152,13 +191,13 @@ tests/                        vitest suites with synthetic candles + fake broker
 
 ## Known limitations
 
-- Entry price is the order's fill price when it fills within ~2s, otherwise the
-  latest bar close — fine for liquid ETFs/BTC, but slippage isn't modeled.
-- Positions live in the bot's database; if you close a position manually in
-  Alpaca the bot won't know until its close order fails. Don't co-trade the
-  account.
 - Free-tier market data (IEX feed) has slightly different volumes than the
   consolidated tape; set `ALPACA_DATA_FEED=sip` if you have a data
   subscription.
 - 4-hour "bars closed" checks run at most once a minute, so signals can lag a
   bar close by up to a minute. Irrelevant at these timeframes.
+- A manually-placed trade (or one from outside the configured instrument
+  list) is adopted with a *synthetic* entry time (the tick it was first
+  noticed, not when it actually happened) — the price and stop are still
+  computed from Alpaca's real average entry price, just not the original
+  timestamp.
