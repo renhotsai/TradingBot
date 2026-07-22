@@ -10,6 +10,17 @@ export interface OrderResult {
   orderId: string;
   /** Average fill price when the order filled during our short poll, else null. */
   filledAvgPrice: number | null;
+  /** Actual filled quantity when the order filled during our short poll, else
+   * null — crypto fills can differ slightly from the requested quantity, so
+   * callers should use this instead of assuming the request was filled exactly. */
+  filledQty: number | null;
+}
+
+export interface OrderStatus {
+  orderId: string;
+  status: string;
+  filledAvgPrice: number | null;
+  filledQty: number | null;
 }
 
 export interface Broker {
@@ -21,7 +32,13 @@ export interface Broker {
     instrument: InstrumentConfig,
     side: "buy" | "sell",
     qty: number,
+    clientOrderId: string,
   ): Promise<OrderResult>;
+  getOrderStatus(orderId: string): Promise<OrderStatus>;
+  /** Looks an order up by the client_order_id it was submitted with — the
+   * only way to find it again if the response to the initial submit was
+   * lost before a broker order id could be captured. Null if unknown. */
+  getOrderByClientOrderId(clientOrderId: string): Promise<OrderStatus | null>;
 }
 
 const DATA_URL = "https://data.alpaca.markets";
@@ -157,6 +174,7 @@ export class AlpacaBroker implements Broker {
     instrument: InstrumentConfig,
     side: "buy" | "sell",
     qty: number,
+    clientOrderId: string,
   ): Promise<OrderResult> {
     const order = await this.request<{ id: string; filled_avg_price: string | null }>(
       `${this.baseUrl}/v2/orders`,
@@ -168,6 +186,7 @@ export class AlpacaBroker implements Broker {
           side,
           type: "market",
           time_in_force: instrument.assetClass === "crypto" ? "gtc" : "day",
+          client_order_id: clientOrderId,
         }),
       },
     );
@@ -176,18 +195,49 @@ export class AlpacaBroker implements Broker {
     // real fill price so trade logs are accurate; fall back to latest price.
     for (let i = 0; i < 3; i++) {
       await sleep(700);
-      const status = await this.request<{
-        status: string;
-        filled_avg_price: string | null;
-      }>(`${this.baseUrl}/v2/orders/${order.id}`);
-      if (status.filled_avg_price) {
-        return { orderId: order.id, filledAvgPrice: parseFloat(status.filled_avg_price) };
+      const status = await this.getOrderStatus(order.id);
+      if (status.filledAvgPrice !== null) {
+        return { orderId: order.id, filledAvgPrice: status.filledAvgPrice, filledQty: status.filledQty };
       }
       if (["canceled", "expired", "rejected"].includes(status.status)) {
         throw new Error(`Order ${order.id} for ${instrument.symbol} ${status.status}`);
       }
     }
-    return { orderId: order.id, filledAvgPrice: null };
+    return { orderId: order.id, filledAvgPrice: null, filledQty: null };
+  }
+
+  async getOrderStatus(orderId: string): Promise<OrderStatus> {
+    const raw = await this.request<{
+      id: string;
+      status: string;
+      filled_avg_price: string | null;
+      filled_qty: string | null;
+    }>(`${this.baseUrl}/v2/orders/${orderId}`);
+    return {
+      orderId: raw.id,
+      status: raw.status,
+      filledAvgPrice: raw.filled_avg_price ? parseFloat(raw.filled_avg_price) : null,
+      filledQty: raw.filled_qty ? parseFloat(raw.filled_qty) : null,
+    };
+  }
+
+  async getOrderByClientOrderId(clientOrderId: string): Promise<OrderStatus | null> {
+    try {
+      const raw = await this.request<{
+        id: string;
+        status: string;
+        filled_avg_price: string | null;
+        filled_qty: string | null;
+      }>(`${this.baseUrl}/v2/orders:by_client_order_id?client_order_id=${encodeURIComponent(clientOrderId)}`);
+      return {
+        orderId: raw.id,
+        status: raw.status,
+        filledAvgPrice: raw.filled_avg_price ? parseFloat(raw.filled_avg_price) : null,
+        filledQty: raw.filled_qty ? parseFloat(raw.filled_qty) : null,
+      };
+    } catch {
+      return null;
+    }
   }
 }
 

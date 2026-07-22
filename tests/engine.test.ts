@@ -165,6 +165,79 @@ describe("TradingEngine.runTick", () => {
     expect(btc!.trailStop).not.toBeNull();
   });
 
+  it("holds a pending order instead of writing the position until the fill is confirmed", async () => {
+    const candles = makeCandles({ closes: meanRevCloses(97.5), timeframeMinutes: 15, now });
+    broker.bars.set("SPY", candles);
+    broker.noImmediateFill.add("SPY"); // order accepted but not yet confirmed filled
+
+    const report = await engine.runTick(now);
+    expect(report.errors).toEqual([]);
+    expect(store.positions.has("SPY")).toBe(false); // not written yet
+    expect(store.pendingOrders.size).toBe(1);
+    const pending = [...store.pendingOrders.values()][0];
+    expect(pending.symbol).toBe("SPY");
+    expect(pending.purpose).toBe("open");
+    expect(pending.brokerOrderId).not.toBeNull();
+    expect(broker.orders).toHaveLength(1);
+
+    // Same bar, order still unresolved: must not submit a second order.
+    await engine.runTick(now);
+    expect(broker.orders).toHaveLength(1);
+    expect(store.pendingOrders.size).toBe(1);
+
+    // Broker confirms the fill on a later tick.
+    await broker.resolveOrder(pending.brokerOrderId!, 97.6, pending.qty);
+    broker.prices.set("SPY", 97.6); // needed for this tick's own stop-check on the newly opened position
+    const report2 = await engine.runTick(now);
+    expect(report2.errors).toEqual([]);
+    expect(store.pendingOrders.size).toBe(0);
+    const pos = store.positions.get("SPY");
+    expect(pos).toBeDefined();
+    expect(pos!.entryPrice).toBe(97.6);
+    expect(pos!.qty).toBe(pending.qty);
+  });
+
+  it("does not resubmit a close order while one is pending, and finalizes the trade once confirmed", async () => {
+    await store.upsertPosition(openPosition({ hardStop: 95.4, qty: 100 }));
+    broker.prices.set("SPY", 95.0); // below the hard stop
+    broker.bars.set("SPY", []);
+    broker.noImmediateFill.add("SPY");
+
+    const report = await engine.runTick(now);
+    expect(report.errors).toEqual([]);
+    expect(store.positions.has("SPY")).toBe(true); // close not confirmed yet
+    expect(store.pendingOrders.size).toBe(1);
+    const pending = [...store.pendingOrders.values()][0];
+    expect(pending.purpose).toBe("close");
+    expect(broker.orders).toHaveLength(1);
+
+    // Stop is still breached, but a close is already in flight: must not resubmit.
+    await engine.runTick(now);
+    expect(broker.orders).toHaveLength(1);
+    expect(store.positions.has("SPY")).toBe(true);
+
+    broker.noImmediateFill.delete("SPY");
+    await broker.resolveOrder(pending.brokerOrderId!, 95.0, 100);
+    await engine.runTick(now);
+    expect(store.positions.has("SPY")).toBe(false);
+    expect(store.pendingOrders.size).toBe(0);
+    expect(store.trades).toHaveLength(1);
+    expect(store.trades[0].exitReason).toBe("hard_stop");
+  });
+
+  it("cleans up the pending order record when the broker rejects the order outright", async () => {
+    const candles = makeCandles({ closes: meanRevCloses(97.5), timeframeMinutes: 15, now });
+    broker.bars.set("SPY", candles);
+    broker.prices.set("SPY", 97.4);
+    broker.failSymbols.add("SPY");
+
+    const report = await engine.runTick(now);
+    expect(report.errors.join(" ")).toContain("insufficient balance");
+    expect(store.positions.has("SPY")).toBe(false);
+    expect(store.pendingOrders.size).toBe(0);
+    expect(broker.orders).toHaveLength(0);
+  });
+
   it("records an equity snapshot and daily P&L every tick", async () => {
     await engine.runTick(now);
     expect(store.equitySnapshots).toHaveLength(1);

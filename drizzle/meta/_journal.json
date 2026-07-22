@@ -8,6 +8,13 @@
       "when": 1784664912828,
       "tag": "0000_wandering_gunslinger",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1784749947520,
+      "tag": "0001_parched_deadpool",
+      "breakpoints": true
     }
   ]
 }

@@ -1,9 +1,10 @@
+import { randomUUID } from "crypto";
 import {
   INSTRUMENTS,
   RISK,
   type InstrumentConfig,
 } from "@/config";
-import { directionToCloseSide, type Broker } from "./broker";
+import { directionToCloseSide, type Broker, type OrderResult } from "./broker";
 import {
   checkStops,
   computeAtr,
@@ -20,7 +21,7 @@ import type {
   Direction,
   StrategyDecision,
 } from "./strategies/types";
-import type { Position, Store, TradeRecord } from "./store";
+import type { PendingOrder, Position, Store, TradeRecord } from "./store";
 
 export interface TickReport {
   time: string;
@@ -101,8 +102,15 @@ export class TradingEngine {
     report.equity = account.equity;
     report.marketOpen = marketOpen;
 
+    // ---- Phase 0: finish orders a previous tick submitted but never saw
+    // through to a filled/rejected outcome. Symbols with an order still
+    // in flight after this are skipped below so we never submit a second
+    // order for the same symbol while the first is unresolved. ----
+    const blockedSymbols = await this.reconcilePendingOrders(now, report);
+
     // ---- Phase 1: manage stops on open positions (every tick) ----
     for (const position of await this.store.getPositions()) {
+      if (blockedSymbols.has(position.symbol)) continue;
       const instrument = INSTRUMENTS.find((i) => i.symbol === position.symbol);
       if (!instrument) continue;
       if (instrument.assetClass === "equity" && !marketOpen) continue;
@@ -122,6 +130,7 @@ export class TradingEngine {
 
     // ---- Phase 2: strategy signals on newly completed bars ----
     for (const instrument of INSTRUMENTS) {
+      if (blockedSymbols.has(instrument.symbol)) continue;
       try {
         if (instrument.assetClass === "equity" && !marketOpen) continue;
 
@@ -173,6 +182,105 @@ export class TradingEngine {
     state.lastError = report.errors.length ? report.errors.join(" | ") : null;
     await this.store.saveBotState(state);
     return report;
+  }
+
+  /**
+   * Resolves every pending order left over from a previous tick: fills it in
+   * (writing the position/trade row) if the broker confirms a fill, drops it
+   * if the broker confirms it never will (canceled/expired/rejected), or
+   * leaves it for next time if the broker still shows it working. Returns
+   * the set of symbols that still have an order in flight after this pass.
+   */
+  private async reconcilePendingOrders(now: Date, report: TickReport): Promise<Set<string>> {
+    const blocked = new Set<string>();
+    const pending = await this.store.getPendingOrders();
+
+    for (const po of pending) {
+      try {
+        const status = po.brokerOrderId
+          ? await this.broker.getOrderStatus(po.brokerOrderId)
+          : await this.broker.getOrderByClientOrderId(po.clientOrderId);
+
+        if (!status) {
+          // Broker has no record yet (or the initial submit never reached
+          // it). Leave it for the next tick to try again.
+          blocked.add(po.symbol);
+          continue;
+        }
+        if (!po.brokerOrderId) {
+          await this.store.attachBrokerOrderId(po.id, status.orderId);
+        }
+
+        if (status.filledAvgPrice !== null) {
+          await this.finalizePendingOrder(po, status.filledAvgPrice, status.filledQty ?? po.qty, now, report);
+          continue;
+        }
+        if (["canceled", "expired", "rejected"].includes(status.status)) {
+          report.errors.push(`${po.symbol}: pending ${po.purpose} order ${status.status}, dropped`);
+          await this.store.deletePendingOrder(po.id);
+          continue;
+        }
+        blocked.add(po.symbol);
+      } catch (e) {
+        report.errors.push(`reconcile ${po.symbol}: ${message(e)}`);
+        blocked.add(po.symbol);
+      }
+    }
+    return blocked;
+  }
+
+  /** Writes the positions/trades row for a confirmed fill, then drops the pending record. */
+  private async finalizePendingOrder(
+    po: PendingOrder,
+    fillPrice: number,
+    filledQty: number,
+    now: Date,
+    report: TickReport,
+  ): Promise<void> {
+    if (po.purpose === "open") {
+      const atr = po.atrAtEntry!;
+      const position: Position = {
+        symbol: po.symbol,
+        strategy: po.strategy,
+        direction: po.direction,
+        qty: filledQty,
+        entryPrice: fillPrice,
+        entryTime: po.createdAt,
+        atrAtEntry: atr,
+        hardStop: hardStopPrice(fillPrice, po.direction, atr),
+        watermark: fillPrice,
+        trailStop:
+          po.trailAtrMult !== null
+            ? hardStopPrice(fillPrice, po.direction, po.trailAtrMult * atr)
+            : null,
+        trailAtrMult: po.trailAtrMult,
+        lastPrice: fillPrice,
+      };
+      await this.store.upsertPosition(position);
+      report.actions.push(
+        `${po.symbol}: opened ${po.direction} ${filledQty} @ ${fillPrice.toFixed(2)} (stop ${position.hardStop.toFixed(2)})`,
+      );
+    } else {
+      const sign = po.direction === "long" ? 1 : -1;
+      const pnl = (fillPrice - po.entryPrice!) * filledQty * sign;
+      await this.store.insertTrade({
+        closedAt: now.toISOString(),
+        symbol: po.symbol,
+        strategy: po.strategy,
+        direction: po.direction,
+        qty: filledQty,
+        entryPrice: po.entryPrice!,
+        exitPrice: fillPrice,
+        pnl,
+        exitReason: po.exitReason!,
+        entryTime: po.entryTime!,
+      });
+      await this.store.deletePosition(po.symbol);
+      report.actions.push(
+        `${po.symbol}: closed ${po.direction} ${filledQty} @ ${fillPrice.toFixed(2)} (${po.exitReason}, pnl ${pnl.toFixed(2)})`,
+      );
+    }
+    await this.store.deletePendingOrder(po.id);
   }
 
   private async applyDecision(
@@ -243,30 +351,37 @@ export class TradingEngine {
     }
 
     const side = direction === "long" ? "buy" : "sell";
-    const order = await this.broker.submitMarketOrder(instrument, side, qty);
-    const entryPrice = order.filledAvgPrice ?? referencePrice;
-
-    const position: Position = {
+    const pending = await this.store.createPendingOrder({
+      clientOrderId: randomUUID(),
+      brokerOrderId: null,
       symbol: instrument.symbol,
+      side,
+      purpose: "open",
+      qty,
       strategy: instrument.strategy,
       direction,
-      qty,
-      entryPrice,
-      entryTime: now.toISOString(),
       atrAtEntry: atr,
-      hardStop: hardStopPrice(entryPrice, direction, atr),
-      watermark: entryPrice,
-      trailStop:
-        trailAtrMult(instrument) !== null
-          ? hardStopPrice(entryPrice, direction, trailAtrMult(instrument)! * atr)
-          : null,
       trailAtrMult: trailAtrMult(instrument),
-      lastPrice: entryPrice,
-    };
-    await this.store.upsertPosition(position);
-    report.actions.push(
-      `${instrument.symbol}: opened ${direction} ${qty} @ ${entryPrice.toFixed(2)} (stop ${position.hardStop.toFixed(2)})`,
-    );
+      entryPrice: null,
+      entryTime: null,
+      exitReason: null,
+      createdAt: now.toISOString(),
+    });
+
+    let order: OrderResult;
+    try {
+      order = await this.broker.submitMarketOrder(instrument, side, qty, pending.clientOrderId);
+    } catch (e) {
+      await this.store.deletePendingOrder(pending.id);
+      throw e;
+    }
+
+    if (order.filledAvgPrice !== null) {
+      await this.finalizePendingOrder(pending, order.filledAvgPrice, order.filledQty ?? qty, now, report);
+    } else {
+      await this.store.attachBrokerOrderId(pending.id, order.orderId);
+      report.actions.push(`${instrument.symbol}: ${side} order submitted, awaiting fill confirmation`);
+    }
   }
 
   private async closePosition(
@@ -276,33 +391,38 @@ export class TradingEngine {
     now: Date,
     report: TickReport,
   ): Promise<void> {
-    const order = await this.broker.submitMarketOrder(
-      instrument,
-      directionToCloseSide(position.direction),
-      position.qty,
-    );
-    const exitPrice =
-      order.filledAvgPrice ?? (await this.broker.getLatestPrice(instrument));
-
-    const sign = position.direction === "long" ? 1 : -1;
-    const pnl = (exitPrice - position.entryPrice) * position.qty * sign;
-
-    await this.store.insertTrade({
-      closedAt: now.toISOString(),
-      symbol: position.symbol,
+    const side = directionToCloseSide(position.direction);
+    const pending = await this.store.createPendingOrder({
+      clientOrderId: randomUUID(),
+      brokerOrderId: null,
+      symbol: instrument.symbol,
+      side,
+      purpose: "close",
+      qty: position.qty,
       strategy: position.strategy,
       direction: position.direction,
-      qty: position.qty,
+      atrAtEntry: null,
+      trailAtrMult: null,
       entryPrice: position.entryPrice,
-      exitPrice,
-      pnl,
-      exitReason: reason,
       entryTime: position.entryTime,
+      exitReason: reason,
+      createdAt: now.toISOString(),
     });
-    await this.store.deletePosition(position.symbol);
-    report.actions.push(
-      `${position.symbol}: closed ${position.direction} ${position.qty} @ ${exitPrice.toFixed(2)} (${reason}, pnl ${pnl.toFixed(2)})`,
-    );
+
+    let order: OrderResult;
+    try {
+      order = await this.broker.submitMarketOrder(instrument, side, position.qty, pending.clientOrderId);
+    } catch (e) {
+      await this.store.deletePendingOrder(pending.id);
+      throw e;
+    }
+
+    if (order.filledAvgPrice !== null) {
+      await this.finalizePendingOrder(pending, order.filledAvgPrice, order.filledQty ?? position.qty, now, report);
+    } else {
+      await this.store.attachBrokerOrderId(pending.id, order.orderId);
+      report.actions.push(`${instrument.symbol}: ${side} order submitted to close position, awaiting fill confirmation`);
+    }
   }
 }
 
