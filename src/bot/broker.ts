@@ -27,6 +27,7 @@ export interface BrokerPosition {
   symbol: string;
   side: Direction;
   qty: number;
+  avgEntryPrice: number;
 }
 
 export interface Broker {
@@ -252,22 +253,31 @@ export class AlpacaBroker implements Broker {
   }
 
   async getOpenPositions(): Promise<BrokerPosition[]> {
-    const raw = await this.request<{ symbol: string; side: string; qty: string }[]>(
-      `${this.baseUrl}/v2/positions`,
-    );
+    const raw = await this.request<
+      { symbol: string; side: string; qty: string; avg_entry_price: string }[]
+    >(`${this.baseUrl}/v2/positions`);
     return raw.map((p) => ({
       symbol: p.symbol,
       side: p.side === "short" ? "short" : "long",
       qty: Math.abs(parseFloat(p.qty)),
+      avgEntryPrice: parseFloat(p.avg_entry_price),
     }));
   }
 
   async getOpenPosition(symbol: string): Promise<BrokerPosition | null> {
     try {
-      const p = await this.request<{ symbol: string; side: string; qty: string }>(
-        `${this.baseUrl}/v2/positions/${encodeURIComponent(symbol)}`,
-      );
-      return { symbol: p.symbol, side: p.side === "short" ? "short" : "long", qty: Math.abs(parseFloat(p.qty)) };
+      const p = await this.request<{
+        symbol: string;
+        side: string;
+        qty: string;
+        avg_entry_price: string;
+      }>(`${this.baseUrl}/v2/positions/${encodeURIComponent(symbol)}`);
+      return {
+        symbol: p.symbol,
+        side: p.side === "short" ? "short" : "long",
+        qty: Math.abs(parseFloat(p.qty)),
+        avgEntryPrice: parseFloat(p.avg_entry_price),
+      };
     } catch {
       return null;
     }
