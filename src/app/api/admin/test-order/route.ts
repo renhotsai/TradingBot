@@ -25,6 +25,18 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
+  if (req.nextUrl.searchParams.get("action") === "positions") {
+    const baseUrl = (process.env.APCA_API_BASE_URL ?? "https://paper-api.alpaca.markets").replace(/\/+$/, "").replace(/\/v2$/, "");
+    const res = await fetch(`${baseUrl}/v2/positions`, {
+      headers: {
+        "APCA-API-KEY-ID": process.env.APCA_API_KEY_ID ?? "",
+        "APCA-API-SECRET-KEY": process.env.APCA_API_SECRET_KEY ?? "",
+      },
+    });
+    const body = await res.json();
+    return NextResponse.json({ status: res.status, body });
+  }
+
   const symbol = req.nextUrl.searchParams.get("symbol") ?? "BTC/USD";
   const instrument = instrumentBySymbol(symbol);
   if (!instrument) {
