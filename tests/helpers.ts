@@ -88,7 +88,7 @@ export class FakeBroker implements Broker {
     this.orderRecords.set(orderId, status);
     this.orderMeta.set(orderId, { symbol: instrument.symbol, side });
     this.clientOrderIds.set(clientOrderId, orderId);
-    if (price !== null) this.applyFill(instrument.symbol, side, qty);
+    if (price !== null) this.applyFill(instrument.symbol, side, qty, price);
     return { orderId, filledAvgPrice: status.filledAvgPrice, filledQty: status.filledQty };
   }
 
@@ -115,13 +115,18 @@ export class FakeBroker implements Broker {
   async resolveOrder(orderId: string, filledAvgPrice: number, filledQty: number): Promise<void> {
     this.orderRecords.set(orderId, { orderId, status: "filled", filledAvgPrice, filledQty });
     const meta = this.orderMeta.get(orderId);
-    if (meta) this.applyFill(meta.symbol, meta.side, filledQty);
+    if (meta) this.applyFill(meta.symbol, meta.side, filledQty, filledAvgPrice);
   }
 
-  private applyFill(symbol: string, side: "buy" | "sell", qty: number): void {
+  private applyFill(symbol: string, side: "buy" | "sell", qty: number, price: number): void {
     const existing = this.brokerPositions.get(symbol);
     if (!existing) {
-      this.brokerPositions.set(symbol, { symbol, side: side === "buy" ? "long" : "short", qty });
+      this.brokerPositions.set(symbol, {
+        symbol,
+        side: side === "buy" ? "long" : "short",
+        qty,
+        avgEntryPrice: price,
+      });
       return;
     }
     const isClosing =
@@ -131,7 +136,9 @@ export class FakeBroker implements Broker {
       if (remaining <= 1e-9) this.brokerPositions.delete(symbol);
       else this.brokerPositions.set(symbol, { ...existing, qty: remaining });
     } else {
-      this.brokerPositions.set(symbol, { ...existing, qty: existing.qty + qty });
+      const totalQty = existing.qty + qty;
+      const avgEntryPrice = (existing.avgEntryPrice * existing.qty + price * qty) / totalQty;
+      this.brokerPositions.set(symbol, { ...existing, qty: totalQty, avgEntryPrice });
     }
   }
 }

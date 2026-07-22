@@ -4,7 +4,7 @@ import {
   RISK,
   type InstrumentConfig,
 } from "@/config";
-import { directionToCloseSide, type Broker, type OrderResult } from "./broker";
+import { directionToCloseSide, type Broker, type BrokerPosition, type OrderResult } from "./broker";
 import {
   checkStops,
   computeAtr,
@@ -107,6 +107,14 @@ export class TradingEngine {
     // in flight after this are skipped below so we never submit a second
     // order for the same symbol while the first is unresolved. ----
     const blockedSymbols = await this.reconcilePendingOrders(now, report);
+
+    // ---- Phase 0.5: catch any broker position the DB has no record of at
+    // all (manual trade, or a position opened before this reconciliation
+    // logic existed). Nothing else here ever looks past the DB's own
+    // position list, so an untracked position would otherwise sit with no
+    // stop-loss protection indefinitely instead of just until the next
+    // trade on that symbol. ----
+    await this.adoptUntrackedPositions(now, report);
 
     // ---- Phase 1: manage stops on open positions (every tick) ----
     for (const position of await this.store.getPositions()) {
@@ -227,6 +235,79 @@ export class TradingEngine {
       }
     }
     return blocked;
+  }
+
+  /**
+   * Scans every position the broker actually holds and adopts any that have
+   * no matching DB row — computing a real ATR-based stop from fresh candles
+   * and the broker's own average entry price, so it comes under the same
+   * stop-loss/trailing-stop management as any position the bot opened
+   * itself, starting this tick rather than never.
+   */
+  private async adoptUntrackedPositions(now: Date, report: TickReport): Promise<void> {
+    let brokerPositions: BrokerPosition[];
+    try {
+      brokerPositions = await this.broker.getOpenPositions();
+    } catch (e) {
+      report.errors.push(`reconcile-sweep: ${message(e)}`);
+      return;
+    }
+
+    const dbSymbols = new Set((await this.store.getPositions()).map((p) => p.symbol));
+
+    for (const bp of brokerPositions) {
+      if (dbSymbols.has(bp.symbol)) continue;
+
+      const instrument = INSTRUMENTS.find((i) => i.symbol === bp.symbol);
+      if (!instrument) {
+        report.errors.push(
+          `${bp.symbol}: RECONCILE mismatch — Alpaca shows ${bp.side} ${bp.qty} but this isn't a ` +
+            `configured instrument; left unmanaged`,
+        );
+        continue;
+      }
+
+      try {
+        const candles = completedCandles(
+          await this.broker.getBars(instrument),
+          instrument.timeframeMinutes,
+          now,
+        );
+        const atr = computeAtr(candles, RISK.atrPeriod);
+        if (atr === null || atr <= 0) {
+          report.errors.push(
+            `${bp.symbol}: RECONCILE mismatch — Alpaca shows ${bp.side} ${bp.qty} with no DB record, ` +
+              `and not enough bar data to adopt it with a stop; left unmanaged`,
+          );
+          continue;
+        }
+
+        const tMult = trailAtrMult(instrument);
+        const position: Position = {
+          symbol: bp.symbol,
+          strategy: instrument.strategy,
+          direction: bp.side,
+          qty: bp.qty,
+          entryPrice: bp.avgEntryPrice,
+          entryTime: now.toISOString(),
+          atrAtEntry: atr,
+          hardStop: hardStopPrice(bp.avgEntryPrice, bp.side, atr),
+          watermark: bp.avgEntryPrice,
+          trailStop: tMult !== null ? hardStopPrice(bp.avgEntryPrice, bp.side, tMult * atr) : null,
+          trailAtrMult: tMult,
+          lastPrice: bp.avgEntryPrice,
+        };
+        await this.store.upsertPosition(position);
+        report.errors.push(
+          `${bp.symbol}: RECONCILE mismatch — Alpaca shows ${bp.side} ${bp.qty} @ ${bp.avgEntryPrice.toFixed(2)} with no DB record`,
+        );
+        report.actions.push(
+          `${bp.symbol}: adopted untracked ${bp.side} ${bp.qty} @ ${bp.avgEntryPrice.toFixed(2)} into management (stop ${position.hardStop.toFixed(2)})`,
+        );
+      } catch (e) {
+        report.errors.push(`${bp.symbol}: failed to adopt untracked position: ${message(e)}`);
+      }
+    }
   }
 
   /** Writes the positions/trades row for a confirmed fill, then drops the pending record. */

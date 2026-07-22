@@ -48,6 +48,7 @@ async function seed(store: MemoryStore, broker: FakeBroker, position: Position):
     symbol: position.symbol,
     side: position.direction,
     qty: position.qty,
+    avgEntryPrice: position.entryPrice,
   });
 }
 
@@ -251,25 +252,30 @@ describe("TradingEngine.runTick", () => {
     expect(broker.orders).toHaveLength(0);
   });
 
-  it("refuses to open a new position when the broker already shows one the DB doesn't know about", async () => {
-    const candles = makeCandles({ closes: meanRevCloses(97.5), timeframeMinutes: 15, now });
-    broker.bars.set("SPY", candles);
-    broker.prices.set("SPY", 97.4);
-    // Broker shows a position the DB has never recorded (e.g. manual trade,
-    // or a previous desync) — must not be piled on top of.
-    broker.brokerPositions.set("SPY", { symbol: "SPY", side: "long", qty: 40 });
+  it("adopts a broker position the DB has no record of, protecting it with a stop the same tick", async () => {
+    // Broker already holds a position the DB has never recorded (e.g. a
+    // manual trade, or one opened before this reconciliation logic existed).
+    broker.brokerPositions.set("BTC/USD", { symbol: "BTC/USD", side: "long", qty: 0.01, avgEntryPrice: 100 });
+    broker.bars.set("BTC/USD", breakoutCandles(105, 1000)); // enough bars for ATR; volume too low to also trigger a signal
+    broker.prices.set("BTC/USD", 105);
 
     const report = await engine.runTick(now);
+
     expect(report.errors.join(" ")).toContain("RECONCILE mismatch");
-    expect(broker.orders).toHaveLength(0);
-    expect(store.positions.has("SPY")).toBe(false);
-    expect(store.pendingOrders.size).toBe(0);
+    expect(report.actions.join(" ")).toContain("adopted untracked");
+    const pos = store.positions.get("BTC/USD");
+    expect(pos).toBeDefined();
+    expect(pos!.direction).toBe("long");
+    expect(pos!.qty).toBe(0.01);
+    expect(pos!.entryPrice).toBe(100); // the broker's real avg entry price, not the current price
+    expect(pos!.hardStop).toBeLessThan(100);
+    expect(broker.orders).toHaveLength(0); // adoption itself never places an order
   });
 
   it("closes using the broker's actual quantity when it differs from the DB's recorded quantity", async () => {
     await seed(store, broker, openPosition({ hardStop: 95.4, qty: 100 }));
     // Simulate the kind of rounding drift a real fill can leave behind.
-    broker.brokerPositions.set("SPY", { symbol: "SPY", side: "long", qty: 99.5 });
+    broker.brokerPositions.set("SPY", { symbol: "SPY", side: "long", qty: 99.5, avgEntryPrice: 97.4 });
     broker.prices.set("SPY", 95.0); // below the hard stop
     broker.bars.set("SPY", []);
 
