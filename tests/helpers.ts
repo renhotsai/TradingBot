@@ -1,7 +1,7 @@
 import type { InstrumentConfig } from "@/config";
-import type { AccountInfo, Broker, OrderResult } from "@/bot/broker";
+import type { AccountInfo, Broker, BrokerPosition, OrderResult, OrderStatus } from "@/bot/broker";
 import type { Candle } from "@/bot/strategies/types";
-import type { BotState, Position, Store, TradeRecord } from "@/bot/store";
+import type { BotState, PendingOrder, Position, Store, TradeRecord } from "@/bot/store";
 
 /**
  * Build `count` candles of `timeframeMinutes` bars ending with a bar that has
@@ -33,6 +33,19 @@ export class FakeBroker implements Broker {
   bars = new Map<string, Candle[]>();
   prices = new Map<string, number>();
   orders: { symbol: string; side: "buy" | "sell"; qty: number }[] = [];
+  /** Symbols whose orders should not report an immediate fill, to exercise
+   * the pending-order/reconciliation path even when a price is set. */
+  noImmediateFill = new Set<string>();
+  /** Symbols whose submitMarketOrder call should throw, to exercise cleanup
+   * of the pending-order record on a rejected/failed submission. */
+  failSymbols = new Set<string>();
+  /** The broker's own view of open positions, kept up to date as fills are
+   * confirmed (immediately or via resolveOrder) — what getOpenPosition(s)
+   * reads from, so tests can seed or desync it to exercise reconciliation. */
+  brokerPositions = new Map<string, BrokerPosition>();
+  private orderRecords = new Map<string, OrderStatus>();
+  private orderMeta = new Map<string, { symbol: string; side: "buy" | "sell" }>();
+  private clientOrderIds = new Map<string, string>();
 
   async getAccount(): Promise<AccountInfo> {
     return this.account;
@@ -56,12 +69,70 @@ export class FakeBroker implements Broker {
     instrument: InstrumentConfig,
     side: "buy" | "sell",
     qty: number,
+    clientOrderId: string,
   ): Promise<OrderResult> {
+    if (this.failSymbols.has(instrument.symbol)) {
+      throw new Error(`Alpaca 403 rejected: insufficient balance for ${instrument.symbol}`);
+    }
     this.orders.push({ symbol: instrument.symbol, side, qty });
-    return {
-      orderId: `fake-${this.orders.length}`,
-      filledAvgPrice: this.prices.get(instrument.symbol) ?? null,
+    const orderId = `fake-${this.orders.length}`;
+    const price = this.noImmediateFill.has(instrument.symbol)
+      ? null
+      : this.prices.get(instrument.symbol) ?? null;
+    const status: OrderStatus = {
+      orderId,
+      status: price !== null ? "filled" : "new",
+      filledAvgPrice: price,
+      filledQty: price !== null ? qty : null,
     };
+    this.orderRecords.set(orderId, status);
+    this.orderMeta.set(orderId, { symbol: instrument.symbol, side });
+    this.clientOrderIds.set(clientOrderId, orderId);
+    if (price !== null) this.applyFill(instrument.symbol, side, qty);
+    return { orderId, filledAvgPrice: status.filledAvgPrice, filledQty: status.filledQty };
+  }
+
+  async getOrderStatus(orderId: string): Promise<OrderStatus> {
+    const rec = this.orderRecords.get(orderId);
+    if (!rec) throw new Error(`no such order ${orderId}`);
+    return rec;
+  }
+
+  async getOrderByClientOrderId(clientOrderId: string): Promise<OrderStatus | null> {
+    const orderId = this.clientOrderIds.get(clientOrderId);
+    return orderId ? this.getOrderStatus(orderId) : null;
+  }
+
+  async getOpenPositions(): Promise<BrokerPosition[]> {
+    return [...this.brokerPositions.values()];
+  }
+
+  async getOpenPosition(symbol: string): Promise<BrokerPosition | null> {
+    return this.brokerPositions.get(symbol) ?? null;
+  }
+
+  /** Test helper: simulate the broker confirming a fill on a later poll/tick. */
+  async resolveOrder(orderId: string, filledAvgPrice: number, filledQty: number): Promise<void> {
+    this.orderRecords.set(orderId, { orderId, status: "filled", filledAvgPrice, filledQty });
+    const meta = this.orderMeta.get(orderId);
+    if (meta) this.applyFill(meta.symbol, meta.side, filledQty);
+  }
+
+  private applyFill(symbol: string, side: "buy" | "sell", qty: number): void {
+    const existing = this.brokerPositions.get(symbol);
+    if (!existing) {
+      this.brokerPositions.set(symbol, { symbol, side: side === "buy" ? "long" : "short", qty });
+      return;
+    }
+    const isClosing =
+      (existing.side === "long" && side === "sell") || (existing.side === "short" && side === "buy");
+    if (isClosing) {
+      const remaining = existing.qty - qty;
+      if (remaining <= 1e-9) this.brokerPositions.delete(symbol);
+      else this.brokerPositions.set(symbol, { ...existing, qty: remaining });
+    } else {
+      this.brokerPositions.set(symbol, { ...existing, qty: existing.qty + qty });
+    }
   }
 }
 
@@ -72,6 +143,8 @@ export class MemoryStore implements Store {
   equitySnapshots: { time: string; equity: number }[] = [];
   dailyPnl = new Map<string, { start: number; end: number }>();
   locked = false;
+  pendingOrders = new Map<number, PendingOrder>();
+  private nextPendingId = 1;
 
   async getBotState(): Promise<BotState> {
     return {
@@ -118,5 +191,25 @@ export class MemoryStore implements Store {
     const existing = this.dailyPnl.get(date);
     if (existing) existing.end = equity;
     else this.dailyPnl.set(date, { start: equity, end: equity });
+  }
+
+  async getPendingOrders(): Promise<PendingOrder[]> {
+    return [...this.pendingOrders.values()].map((p) => ({ ...p }));
+  }
+
+  async createPendingOrder(order: Omit<PendingOrder, "id">): Promise<PendingOrder> {
+    const id = this.nextPendingId++;
+    const full: PendingOrder = { ...order, id };
+    this.pendingOrders.set(id, full);
+    return { ...full };
+  }
+
+  async attachBrokerOrderId(id: number, brokerOrderId: string): Promise<void> {
+    const po = this.pendingOrders.get(id);
+    if (po) po.brokerOrderId = brokerOrderId;
+  }
+
+  async deletePendingOrder(id: number): Promise<void> {
+    this.pendingOrders.delete(id);
   }
 }

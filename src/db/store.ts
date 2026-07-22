@@ -2,6 +2,7 @@ import { and, eq, isNull, lt, or, sql } from "drizzle-orm";
 import { getDb, schema } from "./index";
 import type {
   BotState,
+  PendingOrder,
   Position,
   Store,
   TradeRecord,
@@ -151,5 +152,60 @@ export class DbStore implements Store {
           pnl: sql`${equity} - ${schema.dailyPnl.startEquity}`,
         },
       });
+  }
+
+  async getPendingOrders(): Promise<PendingOrder[]> {
+    const rows = await this.db.select().from(schema.pendingOrders);
+    return rows.map((r) => ({
+      id: r.id,
+      clientOrderId: r.clientOrderId,
+      brokerOrderId: r.brokerOrderId,
+      symbol: r.symbol,
+      side: r.side as "buy" | "sell",
+      purpose: r.purpose as "open" | "close",
+      qty: r.qty,
+      strategy: r.strategy as StrategyName,
+      direction: r.direction as Direction,
+      atrAtEntry: r.atrAtEntry,
+      trailAtrMult: r.trailAtrMult,
+      entryPrice: r.entryPrice,
+      entryTime: r.entryTime?.toISOString() ?? null,
+      exitReason: r.exitReason as TradeRecord["exitReason"] | null,
+      createdAt: r.createdAt.toISOString(),
+    }));
+  }
+
+  async createPendingOrder(order: Omit<PendingOrder, "id">): Promise<PendingOrder> {
+    const [row] = await this.db
+      .insert(schema.pendingOrders)
+      .values({
+        clientOrderId: order.clientOrderId,
+        brokerOrderId: order.brokerOrderId,
+        symbol: order.symbol,
+        side: order.side,
+        purpose: order.purpose,
+        qty: order.qty,
+        strategy: order.strategy,
+        direction: order.direction,
+        atrAtEntry: order.atrAtEntry,
+        trailAtrMult: order.trailAtrMult,
+        entryPrice: order.entryPrice,
+        entryTime: order.entryTime ? new Date(order.entryTime) : null,
+        exitReason: order.exitReason,
+        createdAt: new Date(order.createdAt),
+      })
+      .returning();
+    return { ...order, id: row.id };
+  }
+
+  async attachBrokerOrderId(id: number, brokerOrderId: string): Promise<void> {
+    await this.db
+      .update(schema.pendingOrders)
+      .set({ brokerOrderId })
+      .where(eq(schema.pendingOrders.id, id));
+  }
+
+  async deletePendingOrder(id: number): Promise<void> {
+    await this.db.delete(schema.pendingOrders).where(eq(schema.pendingOrders.id, id));
   }
 }

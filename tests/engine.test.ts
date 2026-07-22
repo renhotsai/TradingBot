@@ -40,6 +40,17 @@ function openPosition(overrides: Partial<Position>): Position {
   };
 }
 
+/** Seeds a position into both the DB and the broker's own ledger, so the
+ * engine's broker-vs-DB reconciliation checks see them as already in sync. */
+async function seed(store: MemoryStore, broker: FakeBroker, position: Position): Promise<void> {
+  await store.upsertPosition(position);
+  broker.brokerPositions.set(position.symbol, {
+    symbol: position.symbol,
+    side: position.direction,
+    qty: position.qty,
+  });
+}
+
 describe("TradingEngine.runTick", () => {
   let broker: FakeBroker;
   let store: MemoryStore;
@@ -79,7 +90,7 @@ describe("TradingEngine.runTick", () => {
 
   it("closes a position when the hard stop is breached and logs the trade", async () => {
     const pos = openPosition({ hardStop: 95.4, qty: 100 });
-    await store.upsertPosition(pos);
+    await seed(store, broker, pos);
     broker.prices.set("SPY", 95.0); // below the hard stop
     broker.bars.set("SPY", []);
 
@@ -94,7 +105,7 @@ describe("TradingEngine.runTick", () => {
   });
 
   it("exits a mean-reversion long once price returns to the moving average", async () => {
-    await store.upsertPosition(openPosition({ qty: 50 }));
+    await seed(store, broker, openPosition({ qty: 50 }));
     broker.prices.set("SPY", 100.5);
     broker.bars.set(
       "SPY",
@@ -123,7 +134,9 @@ describe("TradingEngine.runTick", () => {
   });
 
   it("flattens instead of shorting BTC on a confirmed breakdown", async () => {
-    await store.upsertPosition(
+    await seed(
+      store,
+      broker,
       openPosition({
         symbol: "BTC/USD",
         strategy: "momentum_breakout",
@@ -163,6 +176,123 @@ describe("TradingEngine.runTick", () => {
     expect(Number.isInteger(btc!.qty)).toBe(false); // fractional crypto sizing
     expect(btc!.trailAtrMult).toBe(2);
     expect(btc!.trailStop).not.toBeNull();
+  });
+
+  it("holds a pending order instead of writing the position until the fill is confirmed", async () => {
+    const candles = makeCandles({ closes: meanRevCloses(97.5), timeframeMinutes: 15, now });
+    broker.bars.set("SPY", candles);
+    broker.noImmediateFill.add("SPY"); // order accepted but not yet confirmed filled
+
+    const report = await engine.runTick(now);
+    expect(report.errors).toEqual([]);
+    expect(store.positions.has("SPY")).toBe(false); // not written yet
+    expect(store.pendingOrders.size).toBe(1);
+    const pending = [...store.pendingOrders.values()][0];
+    expect(pending.symbol).toBe("SPY");
+    expect(pending.purpose).toBe("open");
+    expect(pending.brokerOrderId).not.toBeNull();
+    expect(broker.orders).toHaveLength(1);
+
+    // Same bar, order still unresolved: must not submit a second order.
+    await engine.runTick(now);
+    expect(broker.orders).toHaveLength(1);
+    expect(store.pendingOrders.size).toBe(1);
+
+    // Broker confirms the fill on a later tick.
+    await broker.resolveOrder(pending.brokerOrderId!, 97.6, pending.qty);
+    broker.prices.set("SPY", 97.6); // needed for this tick's own stop-check on the newly opened position
+    const report2 = await engine.runTick(now);
+    expect(report2.errors).toEqual([]);
+    expect(store.pendingOrders.size).toBe(0);
+    const pos = store.positions.get("SPY");
+    expect(pos).toBeDefined();
+    expect(pos!.entryPrice).toBe(97.6);
+    expect(pos!.qty).toBe(pending.qty);
+  });
+
+  it("does not resubmit a close order while one is pending, and finalizes the trade once confirmed", async () => {
+    await seed(store, broker, openPosition({ hardStop: 95.4, qty: 100 }));
+    broker.prices.set("SPY", 95.0); // below the hard stop
+    broker.bars.set("SPY", []);
+    broker.noImmediateFill.add("SPY");
+
+    const report = await engine.runTick(now);
+    expect(report.errors).toEqual([]);
+    expect(store.positions.has("SPY")).toBe(true); // close not confirmed yet
+    expect(store.pendingOrders.size).toBe(1);
+    const pending = [...store.pendingOrders.values()][0];
+    expect(pending.purpose).toBe("close");
+    expect(broker.orders).toHaveLength(1);
+
+    // Stop is still breached, but a close is already in flight: must not resubmit.
+    await engine.runTick(now);
+    expect(broker.orders).toHaveLength(1);
+    expect(store.positions.has("SPY")).toBe(true);
+
+    broker.noImmediateFill.delete("SPY");
+    await broker.resolveOrder(pending.brokerOrderId!, 95.0, 100);
+    await engine.runTick(now);
+    expect(store.positions.has("SPY")).toBe(false);
+    expect(store.pendingOrders.size).toBe(0);
+    expect(store.trades).toHaveLength(1);
+    expect(store.trades[0].exitReason).toBe("hard_stop");
+  });
+
+  it("cleans up the pending order record when the broker rejects the order outright", async () => {
+    const candles = makeCandles({ closes: meanRevCloses(97.5), timeframeMinutes: 15, now });
+    broker.bars.set("SPY", candles);
+    broker.prices.set("SPY", 97.4);
+    broker.failSymbols.add("SPY");
+
+    const report = await engine.runTick(now);
+    expect(report.errors.join(" ")).toContain("insufficient balance");
+    expect(store.positions.has("SPY")).toBe(false);
+    expect(store.pendingOrders.size).toBe(0);
+    expect(broker.orders).toHaveLength(0);
+  });
+
+  it("refuses to open a new position when the broker already shows one the DB doesn't know about", async () => {
+    const candles = makeCandles({ closes: meanRevCloses(97.5), timeframeMinutes: 15, now });
+    broker.bars.set("SPY", candles);
+    broker.prices.set("SPY", 97.4);
+    // Broker shows a position the DB has never recorded (e.g. manual trade,
+    // or a previous desync) — must not be piled on top of.
+    broker.brokerPositions.set("SPY", { symbol: "SPY", side: "long", qty: 40 });
+
+    const report = await engine.runTick(now);
+    expect(report.errors.join(" ")).toContain("RECONCILE mismatch");
+    expect(broker.orders).toHaveLength(0);
+    expect(store.positions.has("SPY")).toBe(false);
+    expect(store.pendingOrders.size).toBe(0);
+  });
+
+  it("closes using the broker's actual quantity when it differs from the DB's recorded quantity", async () => {
+    await seed(store, broker, openPosition({ hardStop: 95.4, qty: 100 }));
+    // Simulate the kind of rounding drift a real fill can leave behind.
+    broker.brokerPositions.set("SPY", { symbol: "SPY", side: "long", qty: 99.5 });
+    broker.prices.set("SPY", 95.0); // below the hard stop
+    broker.bars.set("SPY", []);
+
+    const report = await engine.runTick(now);
+    expect(report.actions.join(" ")).toContain("qty mismatch");
+    expect(broker.orders).toEqual([{ symbol: "SPY", side: "sell", qty: 99.5 }]);
+    expect(store.trades).toHaveLength(1);
+    expect(store.trades[0].qty).toBe(99.5);
+  });
+
+  it("drops a stale DB position instead of submitting a close when the broker already shows it flat", async () => {
+    await store.upsertPosition(openPosition({ hardStop: 95.4, qty: 100 }));
+    // Deliberately leave broker.brokerPositions empty for "SPY" — the DB
+    // thinks there's a position, but the broker (the source of truth)
+    // doesn't; this is the state a desync eventually reaches.
+    broker.prices.set("SPY", 95.0); // below the hard stop
+    broker.bars.set("SPY", []);
+
+    const report = await engine.runTick(now);
+    expect(report.errors.join(" ")).toContain("RECONCILE mismatch");
+    expect(broker.orders).toHaveLength(0);
+    expect(store.positions.has("SPY")).toBe(false);
+    expect(store.trades).toHaveLength(0);
   });
 
   it("records an equity snapshot and daily P&L every tick", async () => {

@@ -52,6 +52,36 @@ export const dailyPnl = pgTable("daily_pnl", {
   pnl: doublePrecision("pnl").notNull(),
 });
 
+/**
+ * Write-ahead record of an in-flight broker order. Created before the order
+ * is submitted, updated with the broker's order id once accepted, and
+ * deleted once the corresponding positions/trades row has been written (or
+ * the order is confirmed to have never filled). This lets a tick that dies
+ * between "order submitted" and "position table updated" pick the order back
+ * up and finish it on the next tick instead of leaving Alpaca and the
+ * database permanently out of sync.
+ */
+export const pendingOrders = pgTable("pending_orders", {
+  id: serial("id").primaryKey(),
+  /** Generated before submission and passed to Alpaca as client_order_id, so
+   * the order can be found again even if the response to the initial POST
+   * is lost (network error, timeout) before a broker order id is captured. */
+  clientOrderId: text("client_order_id").notNull().unique(),
+  brokerOrderId: text("broker_order_id"),
+  symbol: text("symbol").notNull(),
+  side: text("side").notNull(),
+  purpose: text("purpose").notNull(),
+  qty: doublePrecision("qty").notNull(),
+  strategy: text("strategy").notNull(),
+  direction: text("direction").notNull(),
+  atrAtEntry: doublePrecision("atr_at_entry"),
+  trailAtrMult: doublePrecision("trail_atr_mult"),
+  entryPrice: doublePrecision("entry_price"),
+  entryTime: timestamp("entry_time", { withTimezone: true }),
+  exitReason: text("exit_reason"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+});
+
 export const botState = pgTable("bot_state", {
   id: integer("id").primaryKey(),
   lastBars: jsonb("last_bars").$type<Record<string, string>>().notNull(),
