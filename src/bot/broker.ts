@@ -27,6 +27,16 @@ export interface Broker {
 const DATA_URL = "https://data.alpaca.markets";
 const RETRY_DELAYS_MS = [2000, 4000, 8000];
 
+/**
+ * All broker methods append their own /v2/... path, so tolerate base URLs
+ * configured with a trailing slash and/or /v2 suffix (a common mistake:
+ * APCA_API_BASE_URL=https://paper-api.alpaca.markets/v2 would otherwise
+ * produce doubled /v2/v2/ URLs and 404s).
+ */
+export function normalizeAlpacaBaseUrl(url: string): string {
+  return url.replace(/\/+$/, "").replace(/\/v2$/, "");
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export class AlpacaBroker implements Broker {
@@ -38,11 +48,11 @@ export class AlpacaBroker implements Broker {
   constructor(opts?: { keyId?: string; secretKey?: string; baseUrl?: string; stockFeed?: string }) {
     const keyId = opts?.keyId ?? process.env.APCA_API_KEY_ID ?? "";
     const secretKey = opts?.secretKey ?? process.env.APCA_API_SECRET_KEY ?? "";
-    this.baseUrl = (
+    this.baseUrl = normalizeAlpacaBaseUrl(
       opts?.baseUrl ??
-      process.env.APCA_API_BASE_URL ??
-      "https://paper-api.alpaca.markets"
-    ).replace(/\/$/, "");
+        process.env.APCA_API_BASE_URL ??
+        "https://paper-api.alpaca.markets",
+    );
     this.stockFeed = opts?.stockFeed ?? process.env.ALPACA_DATA_FEED ?? "iex";
     this.headers = {
       "APCA-API-KEY-ID": keyId,
