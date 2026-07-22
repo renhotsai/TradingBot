@@ -57,6 +57,15 @@ const DATA_URL = "https://data.alpaca.markets";
 const RETRY_DELAYS_MS = [2000, 4000, 8000];
 
 /**
+ * Alpaca's orders/bars/trades endpoints take crypto symbols with the slash
+ * (BTC/USD), but the positions endpoints identify crypto positions without
+ * it (BTCUSD) — normalize before comparing or building a positions URL.
+ */
+export function normalizeSymbol(symbol: string): string {
+  return symbol.replace("/", "");
+}
+
+/**
  * All broker methods append their own /v2/... path, so tolerate base URLs
  * configured with a trailing slash and/or /v2 suffix (a common mistake:
  * APCA_API_BASE_URL=https://paper-api.alpaca.markets/v2 would otherwise
@@ -271,9 +280,12 @@ export class AlpacaBroker implements Broker {
         side: string;
         qty: string;
         avg_entry_price: string;
-      }>(`${this.baseUrl}/v2/positions/${encodeURIComponent(symbol)}`);
+      }>(`${this.baseUrl}/v2/positions/${encodeURIComponent(normalizeSymbol(symbol))}`);
       return {
-        symbol: p.symbol,
+        // Return the symbol the caller asked about (canonical, with slash for
+        // crypto) rather than Alpaca's own compact form, so callers can use
+        // it directly against InstrumentConfig.symbol without translating.
+        symbol,
         side: p.side === "short" ? "short" : "long",
         qty: Math.abs(parseFloat(p.qty)),
         avgEntryPrice: parseFloat(p.avg_entry_price),

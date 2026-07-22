@@ -255,7 +255,11 @@ describe("TradingEngine.runTick", () => {
   it("adopts a broker position the DB has no record of, protecting it with a stop the same tick", async () => {
     // Broker already holds a position the DB has never recorded (e.g. a
     // manual trade, or one opened before this reconciliation logic existed).
-    broker.brokerPositions.set("BTC/USD", { symbol: "BTC/USD", side: "long", qty: 0.01, avgEntryPrice: 100 });
+    // Reported as "BTCUSD" — Alpaca's positions endpoints identify crypto
+    // without the slash even though orders/bars use "BTC/USD" — must still
+    // match against the configured instrument and adopt under our own
+    // canonical symbol.
+    broker.brokerPositions.set("BTCUSD", { symbol: "BTCUSD", side: "long", qty: 0.01, avgEntryPrice: 100 });
     broker.bars.set("BTC/USD", breakoutCandles(105, 1000)); // enough bars for ATR; volume too low to also trigger a signal
     broker.prices.set("BTC/USD", 105);
 
@@ -270,6 +274,33 @@ describe("TradingEngine.runTick", () => {
     expect(pos!.entryPrice).toBe(100); // the broker's real avg entry price, not the current price
     expect(pos!.hardStop).toBeLessThan(100);
     expect(broker.orders).toHaveLength(0); // adoption itself never places an order
+  });
+
+  it("does not re-adopt a position already tracked under its canonical symbol", async () => {
+    await store.upsertPosition(
+      openPosition({
+        symbol: "BTC/USD",
+        strategy: "momentum_breakout",
+        qty: 0.01,
+        entryPrice: 100,
+        hardStop: 85,
+        trailStop: 86,
+        trailAtrMult: 2,
+        watermark: 100,
+      }),
+    );
+    // Broker reports it back without the slash, as Alpaca does — must still
+    // be recognized as already tracked, not re-adopted every tick (which
+    // would reset its entry price and stop each time).
+    broker.brokerPositions.set("BTCUSD", { symbol: "BTCUSD", side: "long", qty: 0.01, avgEntryPrice: 100 });
+    broker.prices.set("BTC/USD", 100);
+    broker.bars.set("BTC/USD", []);
+
+    const report = await engine.runTick(now);
+
+    expect(report.actions.join(" ")).not.toContain("adopted untracked");
+    expect(report.errors.join(" ")).not.toContain("RECONCILE mismatch");
+    expect(store.positions.get("BTC/USD")!.entryPrice).toBe(100);
   });
 
   it("closes using the broker's actual quantity when it differs from the DB's recorded quantity", async () => {

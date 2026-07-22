@@ -4,7 +4,13 @@ import {
   RISK,
   type InstrumentConfig,
 } from "@/config";
-import { directionToCloseSide, type Broker, type BrokerPosition, type OrderResult } from "./broker";
+import {
+  directionToCloseSide,
+  normalizeSymbol,
+  type Broker,
+  type BrokerPosition,
+  type OrderResult,
+} from "./broker";
 import {
   checkStops,
   computeAtr,
@@ -253,12 +259,16 @@ export class TradingEngine {
       return;
     }
 
-    const dbSymbols = new Set((await this.store.getPositions()).map((p) => p.symbol));
+    // Alpaca identifies crypto positions without the slash (BTCUSD) even
+    // though orders/bars use it (BTC/USD) — compare normalized either way.
+    const dbSymbols = new Set(
+      (await this.store.getPositions()).map((p) => normalizeSymbol(p.symbol)),
+    );
 
     for (const bp of brokerPositions) {
-      if (dbSymbols.has(bp.symbol)) continue;
+      if (dbSymbols.has(normalizeSymbol(bp.symbol))) continue;
 
-      const instrument = INSTRUMENTS.find((i) => i.symbol === bp.symbol);
+      const instrument = INSTRUMENTS.find((i) => normalizeSymbol(i.symbol) === normalizeSymbol(bp.symbol));
       if (!instrument) {
         report.errors.push(
           `${bp.symbol}: RECONCILE mismatch — Alpaca shows ${bp.side} ${bp.qty} but this isn't a ` +
@@ -276,7 +286,7 @@ export class TradingEngine {
         const atr = computeAtr(candles, RISK.atrPeriod);
         if (atr === null || atr <= 0) {
           report.errors.push(
-            `${bp.symbol}: RECONCILE mismatch — Alpaca shows ${bp.side} ${bp.qty} with no DB record, ` +
+            `${instrument.symbol}: RECONCILE mismatch — Alpaca shows ${bp.side} ${bp.qty} with no DB record, ` +
               `and not enough bar data to adopt it with a stop; left unmanaged`,
           );
           continue;
@@ -284,7 +294,11 @@ export class TradingEngine {
 
         const tMult = trailAtrMult(instrument);
         const position: Position = {
-          symbol: bp.symbol,
+          // Store under our own canonical symbol (e.g. "BTC/USD"), not
+          // Alpaca's positions-endpoint form, so getBars/getLatestPrice/
+          // submitMarketOrder — which all key off InstrumentConfig.symbol —
+          // keep working for it everywhere else in the engine.
+          symbol: instrument.symbol,
           strategy: instrument.strategy,
           direction: bp.side,
           qty: bp.qty,
@@ -299,13 +313,13 @@ export class TradingEngine {
         };
         await this.store.upsertPosition(position);
         report.errors.push(
-          `${bp.symbol}: RECONCILE mismatch — Alpaca shows ${bp.side} ${bp.qty} @ ${bp.avgEntryPrice.toFixed(2)} with no DB record`,
+          `${instrument.symbol}: RECONCILE mismatch — Alpaca shows ${bp.side} ${bp.qty} @ ${bp.avgEntryPrice.toFixed(2)} with no DB record`,
         );
         report.actions.push(
-          `${bp.symbol}: adopted untracked ${bp.side} ${bp.qty} @ ${bp.avgEntryPrice.toFixed(2)} into management (stop ${position.hardStop.toFixed(2)})`,
+          `${instrument.symbol}: adopted untracked ${bp.side} ${bp.qty} @ ${bp.avgEntryPrice.toFixed(2)} into management (stop ${position.hardStop.toFixed(2)})`,
         );
       } catch (e) {
-        report.errors.push(`${bp.symbol}: failed to adopt untracked position: ${message(e)}`);
+        report.errors.push(`${instrument.symbol}: failed to adopt untracked position: ${message(e)}`);
       }
     }
   }
