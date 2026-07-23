@@ -332,6 +332,34 @@ describe("TradingEngine.runTick", () => {
     expect(store.trades).toHaveLength(0);
   });
 
+  it("blocks new equity entries below the equity-trading minimum but still trades crypto", async () => {
+    broker.account = { equity: 1000, buyingPower: 2000 }; // below RISK.equityTradingMinEquity
+    broker.bars.set("SPY", makeCandles({ closes: meanRevCloses(97.5), timeframeMinutes: 15, now }));
+    broker.prices.set("SPY", 97.4);
+    broker.bars.set("BTC/USD", breakoutCandles(111, 2000));
+    broker.prices.set("BTC/USD", 111);
+
+    const report = await engine.runTick(now);
+
+    expect(store.positions.has("SPY")).toBe(false); // equity entry blocked
+    expect(report.actions.join(" ")).toContain("equity trading disabled");
+    expect(store.positions.get("BTC/USD")).toBeDefined(); // crypto still trades
+    expect(broker.orders.every((o) => o.symbol === "BTC/USD")).toBe(true);
+  });
+
+  it("still manages and closes an existing equity position even below the equity-trading minimum", async () => {
+    broker.account = { equity: 1000, buyingPower: 2000 };
+    await seed(store, broker, openPosition({ hardStop: 95.4, qty: 100 }));
+    broker.prices.set("SPY", 95.0); // below the hard stop
+    broker.bars.set("SPY", []);
+
+    await engine.runTick(now);
+
+    expect(store.positions.has("SPY")).toBe(false); // closed despite low equity
+    expect(store.trades).toHaveLength(1);
+    expect(store.trades[0].exitReason).toBe("hard_stop");
+  });
+
   it("records an equity snapshot and daily P&L every tick", async () => {
     await engine.runTick(now);
     expect(store.equitySnapshots).toHaveLength(1);
