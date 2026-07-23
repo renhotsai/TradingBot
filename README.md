@@ -60,6 +60,15 @@ overlapping ticks from double-ordering.
 - **Market hours** — equities only trade while the market is open (Alpaca
   clock); BTC/USD trades 24/7. Alpaca spot crypto cannot be shorted, so BTC
   "short" signals flatten the long instead.
+- **Small-account guard** — equity instruments (SPY/QQQ/GLD/USO) only *open
+  new* positions when account equity is ≥ `RISK.equityTradingMinEquity`
+  (default **$25,000**, the US Pattern Day Trader threshold); below it the
+  bot trades crypto only. Sub-$25k margin accounts are capped at 3
+  day-trades per 5 days, which the mean-reversion churn would trip almost
+  immediately; crypto is exempt from PDT and its larger ATR keeps the
+  1%-risk sizing from over-leveraging. Existing equity positions are always
+  still stop-managed and closed regardless — the gate only blocks new
+  entries.
 - **Resilience** — Alpaca calls retry with exponential backoff (2s/4s/8s); a
   failing instrument or a failed tick never crashes the endpoint — errors are
   recorded and the next minute's tick retries.

@@ -447,6 +447,23 @@ export class TradingEngine {
     now: Date,
     report: TickReport,
   ): Promise<void> {
+    // Small-account guard: don't add *new* equity exposure below the
+    // configured minimum (PDT / leverage reasons — see
+    // RISK.equityTradingMinEquity). This only blocks new entries; Phase 1
+    // still stop-manages and closePosition still closes existing equity
+    // positions, and the adoption sweep still adopts untracked ones, so
+    // nothing is ever left unprotected by this gate.
+    if (
+      instrument.assetClass === "equity" &&
+      account.equity < RISK.equityTradingMinEquity
+    ) {
+      report.actions.push(
+        `${instrument.symbol}: equity trading disabled below $${RISK.equityTradingMinEquity} ` +
+          `(account equity $${account.equity.toFixed(2)}); skipping entry`,
+      );
+      return;
+    }
+
     const atr = computeAtr(candles, RISK.atrPeriod);
     if (atr === null || atr <= 0) {
       report.errors.push(`${instrument.symbol}: not enough data for ATR`);

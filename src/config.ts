@@ -87,6 +87,19 @@ export const RISK = {
   atrPeriod: 14,
   /** A 1-ATR adverse move costs exactly this fraction of account equity. */
   riskPerTrade: 0.01,
+  /**
+   * Equity instruments (SPY/QQQ/GLD/USO) only *open new* positions when the
+   * account is at least this large; below it the bot trades crypto only.
+   *
+   * Rationale: a sub-$25k US margin account is a Pattern Day Trader — capped
+   * at 3 day-trades per rolling 5 days — which the mean-reversion strategy's
+   * intraday churn would trip almost immediately, restricting the account.
+   * Crypto is exempt from PDT, allows fractional sizing, and its larger ATR
+   * keeps the 1%-risk sizing from ballooning into buying-power-capped
+   * leverage. Existing equity positions are always still stop-managed and
+   * closed regardless of this threshold — it only gates new entries.
+   */
+  equityTradingMinEquity: 25000,
 };
 
 export function instrumentBySymbol(symbol: string): InstrumentConfig | undefined {
